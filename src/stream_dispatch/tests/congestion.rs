@@ -156,8 +156,11 @@ async fn test_congestion_control_basics() {
 
 /// An arbitrary raw `timestamp_difference_microseconds`: the peer's clock is unrelated to ours.
 const BASE_DELAY: u32 = 3_000_000_000;
-/// Time between sending a window of data and its ACKs arriving.
-const ROUND_TRIP: Duration = Duration::from_millis(20);
+/// Time between sending a window of data and its ACKs arriving. Long enough to hold
+/// [`QUEUING_DELAY`]: LEDBAT knows that a one-way delay cannot exceed the round trip.
+const ROUND_TRIP: Duration = Duration::from_millis(300);
+/// Queuing delay above LEDBAT's 100 ms target.
+const QUEUING_DELAY: u32 = 250_000;
 const REMOTE_WND: u32 = 1024 * 1024;
 
 fn delay_test_opts(kind: CongestionControllerKind) -> SocketOpts {
@@ -250,18 +253,18 @@ async fn test_ledbat_window_follows_delay_samples() {
     // Less than doubling per round: MTU probing pauses segmentation now and then.
     assert!(window >= initial_window * 8, "slow start: {window}");
 
-    // 500 ms of queuing delay, five times the target.
-    let grown = window;
+    // 250 ms of queuing delay, 2.5 times the target. The current delay filter (the minimum of
+    // the last few samples) sees it after a few ACKs; slow start ends there and from then on
+    // the window shrinks every round.
+    let (mut window, _) = ack_round(&mut t, BASE_DELAY + QUEUING_DELAY).await;
     for _ in 0..3 {
-        (window, _) = ack_round(&mut t, BASE_DELAY + 500_000).await;
+        let (w, _) = ack_round(&mut t, BASE_DELAY + QUEUING_DELAY).await;
+        assert!(
+            w < window,
+            "queuing delay above target: shrinks, {w} >= {window}"
+        );
+        window = w;
     }
-    assert!(
-        window < grown,
-        "queuing delay above target: shrinks, {window} >= {grown}"
-    );
-    let shrunk = window;
-    let (window, _) = ack_round(&mut t, BASE_DELAY + 500_000).await;
-    assert!(window < shrunk, "keeps shrinking, {window} >= {shrunk}");
 }
 
 // Packets that acknowledge nothing new still carry valid delay samples (BEP 29).
@@ -277,7 +280,7 @@ async fn test_ledbat_delay_samples_from_packets_without_new_acks() {
 
     // The remote sends data, acknowledging nothing new, and reports a long queue.
     for seq_nr in 2..6 {
-        let header = remote_header(&t, ST_DATA, seq_nr, last_acked, BASE_DELAY + 500_000);
+        let header = remote_header(&t, ST_DATA, seq_nr, last_acked, BASE_DELAY + QUEUING_DELAY);
         t.send_msg(header, "x");
     }
     t.poll_once_assert_pending().await;
@@ -354,7 +357,7 @@ async fn test_cubic_ignores_delay_samples() {
         }
         windows
     }
-    assert_eq!(windows(0).await, windows(500_000).await);
+    assert_eq!(windows(0).await, windows(QUEUING_DELAY).await);
 }
 
 // We echo the one-way delay of the remote's packets in microseconds, wrapping around.

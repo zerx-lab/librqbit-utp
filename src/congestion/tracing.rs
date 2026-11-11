@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use crate::{constants::CONGESTION_TRACING_LOG_LEVEL, rtte::RttEstimator};
 
-use super::CongestionController;
+use super::{CongestionController, DelaySample};
 
 pub struct TracingController<I> {
     inner: I,
@@ -91,8 +91,8 @@ where
         );
     }
 
-    fn on_delay_sample(&mut self, now: Instant, delay_micros: u32) {
-        self.inner.on_delay_sample(now, delay_micros);
+    fn on_delay_sample(&mut self, now: Instant, sample: DelaySample) {
+        self.inner.on_delay_sample(now, sample);
     }
 
     fn on_send_round(&mut self, flight_size: usize, window_limited: bool) {

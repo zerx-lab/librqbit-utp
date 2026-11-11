@@ -19,7 +19,7 @@ use tracing::{Level, debug, debug_span, event, trace, trace_span};
 
 use crate::{
     Error, UtpSocket,
-    congestion::CongestionController,
+    congestion::{CongestionController, DelaySample},
     constants::{
         ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL,
         SYNACK_RESEND_INTERNAL, UTP_HEADER, calc_pipe_expiry,
@@ -1226,9 +1226,19 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 |s| s.rtte.sample(rtt)
             );
         }
+        // BEP 29: the delay we echo is measured when the packet arrives. Packets the dispatcher
+        // queued after this poll started arrived after `this_poll.now`, so read the clock for
+        // each one, as libutp does; an early reading would understate the delay.
+        let arrival_micros = (self.env.now() - self.socket_created).as_micros() as u32;
+        self.remote_delay_to_echo =
+            delay_to_echo(arrival_micros, msg.header.timestamp_microseconds);
         self.congestion_controller.on_delay_sample(
             self.this_poll.now,
-            msg.header.timestamp_difference_microseconds,
+            DelaySample {
+                ours: msg.header.timestamp_difference_microseconds,
+                theirs: self.remote_delay_to_echo,
+                acked_rtt: result.on_ack_result.new_rtt,
+            },
         );
         self.congestion_controller
             .set_remote_window(msg.header.wnd_size as usize);
@@ -1236,10 +1246,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.this_poll.now,
             result.on_ack_result.acked_bytes,
             &self.rtte,
-        );
-        self.remote_delay_to_echo = delay_to_echo(
-            self.timestamp_microseconds(),
-            msg.header.timestamp_microseconds,
         );
         self.last_remote_window = msg.header.wnd_size;
         #[cfg(feature = "per-connection-metrics")]

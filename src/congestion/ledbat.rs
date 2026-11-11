@@ -11,6 +11,11 @@
 //! difference between a sample and the smallest recent sample (the "base delay") is the queuing
 //! delay. Samples are u32 microseconds that wrap around every ~71 minutes, so every comparison
 //! between them is done with wrapping arithmetic.
+//!
+//! Two corrections from libutp keep a bad base delay from throttling the flow for the length of
+//! the base history: a queuing delay larger than the round-trip time of the acknowledged
+//! segments is impossible, so the base is raised by the excess; and clock drift between the two
+//! peers is cancelled using the samples of the opposite direction.
 
 use std::time::{Duration, Instant};
 
@@ -18,7 +23,7 @@ use tracing::{debug, trace};
 
 use crate::rtte::RttEstimator;
 
-use super::CongestionController;
+use super::{CongestionController, DelaySample};
 
 /// The queuing delay LEDBAT aims for. RFC 6817 §2.5: "TARGET MUST be 100 milliseconds or less";
 /// BEP 29 and libutp use 100 ms.
@@ -66,6 +71,10 @@ const MAX_DELAY_DEVIATION_MICROS: u32 = 10_000_000;
 /// history was wrong to begin with): forget the history and start measuring from scratch rather
 /// than ignoring the peer forever.
 const RELEARN_AFTER_IMPLAUSIBLE_SAMPLES: u32 = 8;
+
+/// The largest single correction for clock drift (libutp's limit). A larger drop of the peer's
+/// base delay towards us is a change of the path or of the peer's clock, not drift.
+const MAX_CLOCK_DRIFT_SHIFT_MICROS: u32 = 10_000;
 
 /// `a < b` for u32 timestamps that wrap around. Correct as long as the two values are less than
 /// 2^31 microseconds (~35 minutes) apart, which the [`MAX_DELAY_DEVIATION_MICROS`] check
@@ -129,6 +138,13 @@ impl BaseDelayHistory {
     fn min(&self) -> Option<u32> {
         self.minima.iter().flatten().copied().reduce(wrapping_min)
     }
+
+    /// Raise every interval's minimum by `offset` microseconds.
+    fn shift(&mut self, offset: u32) {
+        for m in self.minima.iter_mut().flatten() {
+            *m = m.wrapping_add(offset);
+        }
+    }
 }
 
 /// The last [`CURRENT_FILTER`] delay samples with their arrival time (RFC 6817
@@ -176,19 +192,24 @@ impl CurrentDelayFilter {
 #[derive(Clone, Copy)]
 pub struct Ledbat {
     cwnd: f64,
-    /// Slow start runs while `cwnd < ssthresh`. Infinite until the queuing delay first approaches
-    /// the target or a loss happens.
+    /// Slow start runs until the queuing delay first approaches the target or a loss happens,
+    /// and again after a retransmission timeout until the window is back at `ssthresh`. A
+    /// delay-based decrease does not restart it (that would ramp up faster than TCP).
+    slow_start: bool,
     ssthresh: f64,
     mss: usize,
     /// The remote receive window. Like CUBIC, the window never grows beyond it.
     rwnd: usize,
 
+    /// Our delay to the peer.
     base_delays: BaseDelayHistory,
     current_delays: CurrentDelayFilter,
     implausible_samples: u32,
+    /// The peer's delay to us. Only used to detect clock drift.
+    their_base_delays: BaseDelayHistory,
 
     /// Bytes in flight after the last round of sending, and whether that round had more data
-    /// than it could send. Together they tell whether the window is being used.
+    /// than it could send. Together they tell how much of the window is being used.
     flight_size: usize,
     window_limited: bool,
 
@@ -201,8 +222,9 @@ impl core::fmt::Debug for Ledbat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cwnd={},sshthresh={},mss={},base_delay_us={:?},last_delay_us={:?},flight={},window_limited={}",
+            "cwnd={},slow_start={},sshthresh={},mss={},base_delay_us={:?},last_delay_us={:?},flight={},window_limited={}",
             self.window(),
+            self.slow_start,
             self.sshthresh(),
             self.mss,
             self.base_delays.min(),
@@ -215,7 +237,9 @@ impl core::fmt::Debug for Ledbat {
 
 impl PartialEq for Ledbat {
     fn eq(&self, other: &Self) -> bool {
-        self.cwnd == other.cwnd && self.ssthresh == other.ssthresh
+        self.cwnd == other.cwnd
+            && self.ssthresh == other.ssthresh
+            && self.slow_start == other.slow_start
     }
 }
 
@@ -225,12 +249,14 @@ impl Ledbat {
     pub fn new(mss: usize) -> Ledbat {
         Ledbat {
             cwnd: (INIT_CWND * mss) as f64,
+            slow_start: true,
             ssthresh: f64::INFINITY,
             mss,
             rwnd: 0,
             base_delays: BaseDelayHistory::new(),
             current_delays: CurrentDelayFilter::new(),
             implausible_samples: 0,
+            their_base_delays: BaseDelayHistory::new(),
             flight_size: 0,
             window_limited: false,
             srtt: Duration::ZERO,
@@ -240,10 +266,6 @@ impl Ledbat {
 
     fn min_cwnd(&self) -> f64 {
         (MIN_CWND * self.mss) as f64
-    }
-
-    fn in_slow_start(&self) -> bool {
-        self.cwnd < self.ssthresh
     }
 
     /// Current delay minus base delay. Zero without samples: a peer that does not report delays
@@ -257,6 +279,83 @@ impl Ledbat {
         };
         let queuing = current.wrapping_sub(base) as i32;
         Duration::from_micros(u64::try_from(queuing).unwrap_or(0))
+    }
+
+    /// The part of the window the sender actually uses: all of it (up to the remote window) if
+    /// the last send round stopped on a full window, otherwise what was in flight after it.
+    fn used_window(&self) -> f64 {
+        if self.window_limited {
+            self.cwnd.min(self.rwnd as f64)
+        } else {
+            (self.flight_size as f64).min(self.cwnd)
+        }
+    }
+
+    fn add_our_sample(&mut self, now: Instant, delay_micros: u32) {
+        if let Some(base) = self.base_delays.min() {
+            let deviation = (delay_micros.wrapping_sub(base) as i32).unsigned_abs();
+            if deviation > MAX_DELAY_DEVIATION_MICROS {
+                self.implausible_samples += 1;
+                if self.implausible_samples < RELEARN_AFTER_IMPLAUSIBLE_SAMPLES {
+                    trace!(
+                        delay_micros,
+                        base, "LEDBAT: ignoring implausible delay sample"
+                    );
+                    return;
+                }
+                debug!(
+                    delay_micros,
+                    base, "LEDBAT: the peer's clock jumped, measuring delays from scratch"
+                );
+                self.base_delays = BaseDelayHistory::new();
+                self.current_delays = CurrentDelayFilter::new();
+            }
+        }
+        self.implausible_samples = 0;
+
+        self.base_delays.add(now, delay_micros);
+        self.current_delays.add(now, delay_micros);
+    }
+
+    /// Clock drift: if the peer's clock runs faster than ours, our delay samples creep up
+    /// (phantom queuing delay) while its samples of the opposite direction creep down by the
+    /// same amount. So when the peer's base delay drops a little, raise ours by as much, as
+    /// libutp does. A peer that lies about this can only make us less cautious, and the next
+    /// real sample below the raised base undoes it.
+    fn add_their_sample(&mut self, now: Instant, delay_micros: u32) {
+        let previous = self.their_base_delays.min();
+        self.their_base_delays.add(now, delay_micros);
+        let (Some(previous), Some(new)) = (previous, self.their_base_delays.min()) else {
+            return;
+        };
+        if wrapping_lt(new, previous) {
+            let drift = previous.wrapping_sub(new);
+            if drift <= MAX_CLOCK_DRIFT_SHIFT_MICROS {
+                self.base_delays.shift(drift);
+            }
+        }
+    }
+
+    /// A one-way delay can never exceed the round-trip time. If the queuing delay does, the
+    /// base is too low: an outlier sample from the peer, a jump of its clock or ours (e.g. our
+    /// clock stopping while the host was suspended), or drift. Raise the base by the excess, as
+    /// libutp does, so the error is bounded by the RTT instead of lasting until the bucket with
+    /// the bad minimum expires.
+    fn bound_by_rtt(&mut self, now: Instant, rtt: Duration) {
+        let excess = self.queuing_delay(now).saturating_sub(rtt);
+        if excess.is_zero() {
+            return;
+        }
+        // queuing_delay() comes from an i32, so the excess fits.
+        let Ok(excess_micros) = u32::try_from(excess.as_micros()) else {
+            return;
+        };
+        trace!(
+            ?excess,
+            ?rtt,
+            "LEDBAT: queuing delay above the RTT, raising the base delay"
+        );
+        self.base_delays.shift(excess_micros);
     }
 }
 
@@ -296,23 +395,39 @@ impl CongestionController for Ledbat {
         }
 
         let queuing_delay = self.queuing_delay(now);
-        if self.in_slow_start() && queuing_delay >= SLOW_START_EXIT_QUEUING_DELAY {
+        if self.slow_start && queuing_delay >= SLOW_START_EXIT_QUEUING_DELAY {
             trace!(
                 ?queuing_delay,
                 cwnd = self.cwnd,
                 "LEDBAT: leaving slow start"
             );
+            self.slow_start = false;
             self.ssthresh = self.cwnd;
         }
 
         let mss = self.mss as f64;
+        let used = self.used_window();
+        let max_allowed = used + (ALLOWED_INCREASE * self.mss) as f64;
         let old = self.cwnd;
-        let mut cwnd = if self.in_slow_start() {
-            old + len as f64
+        let mut cwnd = if self.slow_start {
+            let cwnd = (old + len as f64).min(self.ssthresh);
+            if cwnd >= self.ssthresh {
+                self.slow_start = false;
+            }
+            cwnd
         } else {
             let target = TARGET.as_secs_f64();
             let off_target = (target - queuing_delay.as_secs_f64()) / target;
-            old + GAIN * off_target * len as f64 * mss / old
+            if off_target < 0. {
+                // Above target: yield. Cut the unused part first (RFC 6817 max_allowed_cwnd),
+                // otherwise the decrease, which is inversely proportional to the window, would
+                // be diluted by a window that is much larger than what is sent (e.g. after the
+                // remote window shrank) and the flow would hardly back off.
+                let from = old.min(max_allowed).max(self.min_cwnd());
+                from + GAIN * off_target * len as f64 * mss / from
+            } else {
+                old + GAIN * off_target * len as f64 * mss / old
+            }
         };
 
         if cwnd > old {
@@ -320,16 +435,11 @@ impl CongestionController for Ledbat {
             // the sender does not fill does not keep growing. If the last send round stopped on a
             // full window, the window is in use and may grow by ALLOWED_INCREASE MSS per ACK;
             // otherwise growth stops at what was actually in flight. Unlike the RFC we do not cut
-            // an existing window down to the flight size: ACKs are processed in batches here (the
-            // flight size shrinks with every ACK of a batch with no sends in between), and a
-            // window cut to 2 MSS after every pause would take hundreds of RTTs to regrow
-            // linearly.
-            let used = if self.window_limited {
-                old
-            } else {
-                self.flight_size as f64
-            };
-            let limit = (used + (ALLOWED_INCREASE * self.mss) as f64).min(self.rwnd as f64);
+            // an existing window down to the flight size while below target: ACKs are processed
+            // in batches here, and an application-limited pause (a slow disk read) would leave a
+            // window that takes hundreds of RTTs to regrow linearly. Above target the unused
+            // part is cut, see above.
+            let limit = max_allowed.min(self.rwnd as f64);
             cwnd = cwnd.min(old.max(limit));
         }
 
@@ -343,6 +453,7 @@ impl CongestionController for Ledbat {
         // up to half the previous window as TCP does (RFC 5681 §3.1).
         self.ssthresh = (self.cwnd / 2.).max(self.min_cwnd());
         self.cwnd = self.min_cwnd();
+        self.slow_start = true;
         self.last_decrease = Some(now);
     }
 
@@ -355,44 +466,28 @@ impl CongestionController for Ledbat {
             self.cwnd = self.cwnd.min((self.cwnd / 2.).max(self.min_cwnd()));
             self.last_decrease = Some(now);
         }
-        // The recovery module uses ssthresh as the window during recovery and slow-starts back
-        // to it afterwards; a loss also ends the initial slow start for good.
+        // The recovery module uses ssthresh as the window during recovery and sets the window
+        // to it afterwards. A loss also ends slow start.
         self.ssthresh = self.cwnd;
+        self.slow_start = false;
     }
 
     fn set_remote_window(&mut self, win: usize) {
         self.rwnd = win;
     }
 
-    fn on_delay_sample(&mut self, now: Instant, delay_micros: u32) {
-        // 0 means the peer has not received anything from us yet (BEP 29, libutp).
-        if delay_micros == 0 {
-            return;
+    fn on_delay_sample(&mut self, now: Instant, sample: DelaySample) {
+        // 0 means the peer has not received anything from us yet, or the packet carries no
+        // timestamp (BEP 29, libutp).
+        if sample.theirs != 0 {
+            self.add_their_sample(now, sample.theirs);
         }
-
-        if let Some(base) = self.base_delays.min() {
-            let deviation = (delay_micros.wrapping_sub(base) as i32).unsigned_abs();
-            if deviation > MAX_DELAY_DEVIATION_MICROS {
-                self.implausible_samples += 1;
-                if self.implausible_samples < RELEARN_AFTER_IMPLAUSIBLE_SAMPLES {
-                    trace!(
-                        delay_micros,
-                        base, "LEDBAT: ignoring implausible delay sample"
-                    );
-                    return;
-                }
-                debug!(
-                    delay_micros,
-                    base, "LEDBAT: the peer's clock jumped, measuring delays from scratch"
-                );
-                self.base_delays = BaseDelayHistory::new();
-                self.current_delays = CurrentDelayFilter::new();
-            }
+        if sample.ours != 0 {
+            self.add_our_sample(now, sample.ours);
         }
-        self.implausible_samples = 0;
-
-        self.base_delays.add(now, delay_micros);
-        self.current_delays.add(now, delay_micros);
+        if let Some(rtt) = sample.acked_rtt {
+            self.bound_by_rtt(now, rtt);
+        }
     }
 
     fn on_send_round(&mut self, flight_size: usize, window_limited: bool) {
@@ -405,7 +500,10 @@ impl CongestionController for Ledbat {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use crate::{congestion::CongestionController, rtte::RttEstimator};
+    use crate::{
+        congestion::{CongestionController, DelaySample},
+        rtte::RttEstimator,
+    };
 
     use super::{BASE_HISTORY, BASE_HISTORY_INTERVAL, Ledbat, RELEARN_AFTER_IMPLAUSIBLE_SAMPLES};
 
@@ -433,17 +531,37 @@ mod tests {
             }
         }
 
-        /// Leave slow start with the given window, as if the delay had approached the target.
+        /// Leave slow start with the given window, as if the delay had approached the target
+        /// there: the state slow start exit leaves behind.
         fn congestion_avoidance(cwnd_mss: usize) -> Self {
             let mut h = Self::new();
             h.ledbat.cwnd = (cwnd_mss * MSS) as f64;
-            h.ledbat.ssthresh = 0.;
+            h.ledbat.slow_start = false;
+            h.ledbat.ssthresh = h.ledbat.cwnd;
             h
         }
 
-        /// Report a raw delay sample.
+        /// Report a raw delay sample from a packet that acknowledges nothing.
         fn sample(&mut self, raw: u32) {
-            self.ledbat.on_delay_sample(self.now, raw);
+            self.ledbat.on_delay_sample(
+                self.now,
+                DelaySample {
+                    ours: raw,
+                    ..Default::default()
+                },
+            );
+        }
+
+        /// Report a raw delay sample from a packet that acknowledges segments sent `rtt` ago.
+        fn sample_acked(&mut self, raw: u32, rtt: Duration) {
+            self.ledbat.on_delay_sample(
+                self.now,
+                DelaySample {
+                    ours: raw,
+                    theirs: 0,
+                    acked_rtt: Some(rtt),
+                },
+            );
         }
 
         /// Report enough samples that the current delay filter holds only this one.
@@ -742,5 +860,138 @@ mod tests {
         );
         h.ledbat.set_remote_window(0);
         assert_eq!(h.ledbat.window(), 0);
+    }
+
+    #[test]
+    fn test_delay_based_decrease_does_not_restart_slow_start() {
+        // Reach congestion avoidance the way production does.
+        let mut h = Harness::new();
+        h.queuing(Duration::ZERO);
+        h.ack_full_window(18);
+        h.current(BASE + 60_000);
+        h.ack_full_window(1);
+        assert!(!h.ledbat.slow_start);
+
+        h.current(BASE + 150_000);
+        h.ack_full_window(20);
+        let shrunk = h.cwnd();
+        assert!(shrunk < (20 * MSS) as f64);
+
+        // The queue drains: congestion avoidance growth, not a slow-start MSS per ACK.
+        h.current(BASE + 10_000);
+        h.ack_full_window(1);
+        let grown = h.cwnd() - shrunk;
+        assert!(
+            grown > 0. && grown < 0.1 * MSS as f64,
+            "grown by {grown} in one ACK"
+        );
+        assert!(!h.ledbat.slow_start);
+    }
+
+    #[test]
+    fn test_outlier_below_base_is_bounded_by_rtt() {
+        let mut h = Harness::congestion_avoidance(20);
+        h.queuing(Duration::ZERO);
+        // A single sample 5 seconds below the real base (a broken or hostile peer).
+        h.sample(BASE.wrapping_sub(5_000_000));
+        h.current(BASE);
+        assert_eq!(h.queuing_delay(), Duration::from_secs(5));
+
+        // The next ACK proves the delay cannot be more than its RTT, and the base is raised.
+        h.sample_acked(BASE, RTT);
+        assert_eq!(h.queuing_delay(), RTT);
+        // 50 ms is below the target: the window keeps growing instead of being pinned at
+        // MIN_CWND until the bucket with the outlier expires ten minutes later.
+        h.ack_full_window(20);
+        assert!(h.cwnd() > (20 * MSS) as f64, "{:?}", h.ledbat);
+
+        // What remains is an over-estimate bounded by the RTT, until the bucket expires.
+        h.current(BASE);
+        assert_eq!(h.queuing_delay(), RTT);
+    }
+
+    #[test]
+    fn test_upward_step_is_bounded_by_rtt() {
+        // All samples jump up by 3 seconds, e.g. because our clock stopped while the host was
+        // suspended and the peer's did not.
+        let mut h = Harness::congestion_avoidance(20);
+        h.queuing(Duration::ZERO);
+        let stepped = BASE + 3_000_000;
+        h.current(stepped);
+        assert_eq!(h.queuing_delay(), Duration::from_secs(3));
+        h.sample_acked(stepped, RTT);
+        assert_eq!(h.queuing_delay(), RTT);
+
+        // Within the RTT the excess is not provably wrong and stays.
+        let mut h = Harness::congestion_avoidance(20);
+        h.queuing(Duration::from_millis(40));
+        h.sample_acked(BASE + 40_000, RTT);
+        assert_eq!(h.queuing_delay(), Duration::from_millis(40));
+    }
+
+    #[test]
+    fn test_clock_drift_is_compensated() {
+        // The peer's clock runs 200 ppm fast: over nine minutes our samples creep up by 108 ms
+        // and the opposite direction's creep down by as much, with no real queuing at all.
+        const THEIR_BASE: u32 = 987_654_321;
+        let run = |with_reverse_samples: bool| {
+            let mut h = Harness::congestion_avoidance(20);
+            let start = h.now;
+            let step = Duration::from_millis(100);
+            while h.now - start < Duration::from_secs(9 * 60) {
+                let drift = ((h.now - start).as_micros() / 5_000) as u32;
+                h.ledbat.on_delay_sample(
+                    h.now,
+                    DelaySample {
+                        ours: BASE.wrapping_add(drift),
+                        theirs: if with_reverse_samples {
+                            THEIR_BASE.wrapping_sub(drift)
+                        } else {
+                            0
+                        },
+                        acked_rtt: None,
+                    },
+                );
+                h.now += step;
+            }
+            h.now -= step;
+            h.queuing_delay()
+        };
+
+        let uncompensated = run(false);
+        assert!(
+            uncompensated > Duration::from_millis(100),
+            "{uncompensated:?}"
+        );
+        let compensated = run(true);
+        assert!(compensated < Duration::from_millis(1), "{compensated:?}");
+    }
+
+    #[test]
+    fn test_unused_window_does_not_dilute_the_decrease() {
+        // A large window, then the peer's receive window drops to 64 segments.
+        let mut h = Harness::congestion_avoidance(1000);
+        h.ledbat.set_remote_window(64 * MSS);
+        h.queuing(Duration::from_millis(200));
+        h.ack_full_window(64);
+        // The unused part is cut at once, and one RTT of ACKs at twice the target then takes
+        // about one MSS off, as with a window of that size. Dividing by the unused 1000 segments
+        // would have left the window at 999.9 segments, far above anything sent.
+        let cwnd_mss = h.cwnd() / MSS as f64;
+        assert!((63.5..64.5).contains(&cwnd_mss), "{:?}", h.ledbat);
+
+        // Application-limited: only 10 segments in flight.
+        let mut h = Harness::congestion_avoidance(100);
+        h.queuing(Duration::from_millis(200));
+        h.ledbat.on_send_round(10 * MSS, false);
+        h.ledbat.on_ack(h.now, MSS, &h.rtte);
+        assert!(h.cwnd() < (11 * MSS) as f64, "{:?}", h.ledbat);
+
+        // Below target an unused window is kept (see on_ack).
+        let mut h = Harness::congestion_avoidance(100);
+        h.queuing(Duration::from_millis(50));
+        h.ledbat.on_send_round(10 * MSS, false);
+        h.ledbat.on_ack(h.now, MSS, &h.rtte);
+        assert_eq!(h.cwnd(), (100 * MSS) as f64);
     }
 }
