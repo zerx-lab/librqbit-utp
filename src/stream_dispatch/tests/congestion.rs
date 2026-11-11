@@ -288,6 +288,28 @@ async fn test_ledbat_delay_samples_from_packets_without_new_acks() {
     assert!(after < window, "{after} >= {window}");
 }
 
+// A chatty application (small writes, the second of each pair held back by Nagle until the
+// first is acknowledged) does not use its window, so LEDBAT does not grow it.
+#[tokio::test]
+async fn test_ledbat_application_limited_with_nagle() {
+    setup_test_logging();
+    let mut t = make_test_vsock(delay_test_opts(CongestionControllerKind::Ledbat), false);
+    assert!(t.vsock.socket_opts.nagle);
+    t.send_msg(remote_header(&t, ST_STATE, 1, 100.into(), BASE_DELAY), "");
+    t.env.increment_now(ROUND_TRIP);
+    t.poll_once_assert_pending().await;
+    let initial_window = t.vsock.congestion_controller.window();
+
+    for _ in 0..10 {
+        for msg in [b"hello", b"world"] {
+            t.stream.as_mut().unwrap().write_all(msg).await.unwrap();
+            t.poll_once_assert_pending().await;
+        }
+        ack_round(&mut t, BASE_DELAY).await;
+    }
+    assert_eq!(t.vsock.congestion_controller.window(), initial_window);
+}
+
 // Loss and retransmission timeouts reduce LEDBAT's window through the recovery module.
 #[tokio::test]
 async fn test_ledbat_loss_and_timeout() {

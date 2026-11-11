@@ -219,6 +219,11 @@ struct ThisPoll {
     restart: bool,
 
     unsegmented_data: usize,
+
+    // Whether the last segmentation left data unsegmented for a reason other than Nagle (the
+    // remote window or a pending MTU probe). Data held back by Nagle is a sub-MSS tail the
+    // application has not followed up yet, so it does not mean the window is in use.
+    segmentation_backlog: bool,
 }
 
 #[derive(Default)]
@@ -632,7 +637,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if let Some(flight_size) = flight_size {
             // All segments were sent, but there is more data in the buffer that is not segmented
             // yet (e.g. while waiting for an MTU probe). The application is not the limit.
-            if self.this_poll.unsegmented_data > 0 {
+            if self.this_poll.segmentation_backlog {
                 window_limited = true;
             }
             self.congestion_controller
@@ -780,6 +785,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> crate::Result<()> {
+        self.this_poll.segmentation_backlog = false;
         let tx_len = {
             let mut g = self.user_tx.locked.write();
             let c = self.user_tx.consumer.lock();
@@ -848,6 +854,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
             PopExpiredProbe::NotExpired => {
                 trace!("MTU probe hasnt expired yet");
+                self.this_poll.segmentation_backlog =
+                    tx_len > self.user_tx_segments.total_len_bytes();
                 return Ok(());
             }
             PopExpiredProbe::Empty => {}
@@ -873,6 +881,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.last_remote_window
         );
 
+        let mut held_by_nagle = false;
         while remaining > 0 && remote_window_remaining > 0 {
             let ss = self.segment_sizes.next_segment_size();
             let min_ss = self.segment_sizes.mss();
@@ -886,6 +895,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                 if self.socket_opts.nagle && !can_send_full_payload && data_in_flight {
                     trace!(max_payload_size, "nagle: buffering more data");
+                    held_by_nagle = true;
                     break;
                 }
             }
@@ -915,6 +925,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         );
 
         self.this_poll.unsegmented_data = remaining;
+        self.this_poll.segmentation_backlog = remaining > 0 && !held_by_nagle;
 
         Ok(())
     }
@@ -1804,6 +1815,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 transport_pending: false,
                 restart: false,
                 unsegmented_data: 0,
+                segmentation_backlog: false,
             },
             parent_span,
             drop_guard: DropGuardSendBeforeDeath::new(
