@@ -140,8 +140,10 @@ struct VirtualSocket<T, Env> {
     // Triggers delay-based operations
     timers: Timers,
 
-    // The last seen value of uTP's "last_remote_timestamp"
-    last_remote_timestamp: u32,
+    // The one-way delay of the last packet the remote sent us, measured when it arrived:
+    // our clock minus its "timestamp_microseconds". Echoed back in the
+    // "timestamp_difference_microseconds" of everything we send (BEP 29).
+    remote_delay_to_echo: u32,
     last_remote_window: u32,
 
     // The seq_nr to use in outgoing packets. It gets incremented AFTER the
@@ -259,9 +261,7 @@ macro_rules! send_data {
             $header.seq_nr = $segment_iter_item.seq_nr();
             $header.timestamp_microseconds =
                 ($self.env.now() - $self.socket_created).as_micros() as u32;
-            $header.timestamp_difference_microseconds = $header
-                .timestamp_microseconds
-                .wrapping_sub($self.last_remote_timestamp);
+            $header.timestamp_difference_microseconds = $self.remote_delay_to_echo;
 
             let mut h = [0u8; UTP_HEADER as usize];
             let hlen = $header.serialize(&mut h)?;
@@ -336,16 +336,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
     /// Create a stub header for a new outgoing message.
     pub(crate) fn outgoing_header(&self) -> UtpHeader {
-        let mut header = UtpHeader::default();
-        header.connection_id = self.conn_id_send;
-        header.timestamp_microseconds = self.timestamp_microseconds();
-        header.timestamp_difference_microseconds = header
-            .timestamp_microseconds
-            .wrapping_sub(self.last_remote_timestamp);
-        header.seq_nr = self.seq_nr;
-        header.ack_nr = self.last_consumed_remote_seq_nr;
-        header.wnd_size = self.rx_window();
-        header
+        UtpHeader {
+            connection_id: self.conn_id_send,
+            timestamp_microseconds: self.timestamp_microseconds(),
+            timestamp_difference_microseconds: self.remote_delay_to_echo,
+            seq_nr: self.seq_nr,
+            ack_nr: self.last_consumed_remote_seq_nr,
+            wnd_size: self.rx_window(),
+            ..Default::default()
+        }
     }
 
     // TODO: implement this better
@@ -559,21 +558,28 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         }
 
-        let mut remaining_cwnd = self
-            .recovery
-            .remaining_cwnd(self.last_remote_window)
-            .unwrap_or_else(|| {
-                self.congestion_controller
-                    .window()
-                    .min(self.last_remote_window as usize)
-                    .saturating_sub(
-                        self.user_tx_segments
-                            .calc_flight_size(self.last_sent_seq_nr),
-                    )
-            });
+        // The flight size is only known (and the window only up to the congestion controller)
+        // outside of recovery.
+        let (mut remaining_cwnd, flight_size) =
+            match self.recovery.remaining_cwnd(self.last_remote_window) {
+                Some(remaining_cwnd) => (remaining_cwnd, None),
+                None => {
+                    let flight_size = self
+                        .user_tx_segments
+                        .calc_flight_size(self.last_sent_seq_nr);
+                    let remaining_cwnd = self
+                        .congestion_controller
+                        .window()
+                        .min(self.last_remote_window as usize)
+                        .saturating_sub(flight_size);
+                    (remaining_cwnd, Some(flight_size))
+                }
+            };
 
         let mut sent_count = 0;
-
+        let mut sent_bytes = 0;
+        // Whether sending stopped for any reason other than running out of application data.
+        let mut window_limited = false;
         let mut message_too_long = None;
 
         // Send the stuff we haven't sent yet, up to sender's window.
@@ -584,6 +590,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if remaining_cwnd < item.payload_size() {
                 METRICS.send_window_exhausted.increment(1);
                 trace_every_ms!(100, "remote recv window exhausted");
+                window_limited = true;
                 break;
             }
 
@@ -597,10 +604,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         "sent ST_DATA"
                     );
                     remaining_cwnd -= item.payload_size();
+                    sent_bytes += item.payload_size();
                     sent_count += 1;
                 }
                 // Transport was pending, need to retry
                 Ok(false) => {
+                    window_limited = true;
                     break;
                 }
                 // If we couldn't send due to message size, we need to tweak MTU if possible and then retry.
@@ -613,10 +622,21 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         "got message too long (EMSGSIZE): {source:#}"
                     );
                     message_too_long = Some((seq_nr, size));
+                    window_limited = true;
                     break;
                 }
                 Err(e) => return Err(e),
             }
+        }
+
+        if let Some(flight_size) = flight_size {
+            // All segments were sent, but there is more data in the buffer that is not segmented
+            // yet (e.g. while waiting for an MTU probe). The application is not the limit.
+            if self.this_poll.unsegmented_data > 0 {
+                window_limited = true;
+            }
+            self.congestion_controller
+                .on_send_round(flight_size + sent_bytes, window_limited);
         }
 
         if let Some((seq_nr, size)) = message_too_long {
@@ -1195,6 +1215,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 |s| s.rtte.sample(rtt)
             );
         }
+        self.congestion_controller.on_delay_sample(
+            self.this_poll.now,
+            msg.header.timestamp_difference_microseconds,
+        );
         self.congestion_controller
             .set_remote_window(msg.header.wnd_size as usize);
         self.congestion_controller.on_ack(
@@ -1202,7 +1226,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             result.on_ack_result.acked_bytes,
             &self.rtte,
         );
-        self.last_remote_timestamp = msg.header.timestamp_microseconds;
+        self.remote_delay_to_echo = delay_to_echo(
+            self.timestamp_microseconds(),
+            msg.header.timestamp_microseconds,
+        );
         self.last_remote_window = msg.header.wnd_size;
         #[cfg(feature = "per-connection-metrics")]
         {
@@ -1571,6 +1598,17 @@ impl<T, E> Drop for VirtualSocket<T, E> {
     }
 }
 
+/// The "timestamp_difference_microseconds" to echo for a packet stamped `remote_timestamp` that
+/// arrived when our clock read `now_micros` (BEP 29). Both clocks wrap around at u32::MAX, so the
+/// difference is wrapping too. A packet without a timestamp gives 0, which tells the peer that
+/// there is no sample, as libutp does.
+fn delay_to_echo(now_micros: u32, remote_timestamp: u32) -> u32 {
+    if remote_timestamp == 0 {
+        return 0;
+    }
+    now_micros.wrapping_sub(remote_timestamp)
+}
+
 // See field descriptions / meanings in struct VirtualSocket
 pub struct StreamArgs {
     conn_id_recv: SeqNr,
@@ -1739,7 +1777,10 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                     timer
                 },
             },
-            last_remote_timestamp,
+            remote_delay_to_echo: delay_to_echo(
+                (now - socket.created).as_micros() as u32,
+                last_remote_timestamp,
+            ),
             last_remote_window: remote_window,
             seq_nr,
             last_sent_seq_nr,

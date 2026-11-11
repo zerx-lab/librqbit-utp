@@ -46,21 +46,47 @@ type ConnectionId = SeqNr;
 // When we get incoming packets this connection id is used to pick the stream.
 type StreamRecvKey = (SocketAddr, ConnectionId);
 
-#[derive(Debug, Default, Clone, Copy)]
+/// Which congestion controller new connections use.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum CongestionControllerKind {
+    /// CUBIC (RFC 8312), the default. Loss-based like TCP: it fills the bottleneck queue until
+    /// packets are dropped and competes with other flows for an equal share of the link.
     #[default]
     Cubic,
+    /// LEDBAT (RFC 6817), the delay-based controller BEP 29 specifies for uTP and libutp
+    /// (uTorrent, qBittorrent) uses. It keeps the queuing delay it adds to the path around
+    /// 100 ms and backs off when other traffic makes the queue grow, so bulk transfers do not
+    /// slow down web browsing, games or calls sharing the same link. The price: next to
+    /// loss-based flows (most TCP traffic) it gets less than an equal share of the bandwidth,
+    /// and its growth is at most TCP's congestion avoidance rate once slow start is over.
+    Ledbat,
 }
 
+/// Congestion control settings of a [`SocketOpts`].
+///
+/// ```
+/// use librqbit_utp::{CongestionConfig, CongestionControllerKind, SocketOpts};
+///
+/// let opts = SocketOpts {
+///     congestion: CongestionConfig {
+///         kind: CongestionControllerKind::Ledbat,
+///         ..Default::default()
+///     },
+///     ..Default::default()
+/// };
+/// ```
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CongestionConfig {
+    /// The congestion controller algorithm.
     pub kind: CongestionControllerKind,
+    /// Log every change of the congestion window at DEBUG level.
     pub tracing: bool,
 }
 
 impl CongestionConfig {
     pub(crate) fn create(&self, now: Instant, rmss: usize) -> Box<dyn CongestionController> {
         use crate::congestion::cubic::Cubic;
+        use crate::congestion::ledbat::Ledbat;
         use crate::congestion::tracing::TracingController;
 
         match (self.kind, self.tracing) {
@@ -69,6 +95,11 @@ impl CongestionConfig {
                 Box::new(TracingController::new(Cubic::new(now, rmss)))
             }
             (CongestionControllerKind::Cubic, false) => Box::new(Cubic::new(now, rmss)),
+            (CongestionControllerKind::Ledbat, true) => {
+                tracing::debug!("enabling congestion tracing");
+                Box::new(TracingController::new(Ledbat::new(rmss)))
+            }
+            (CongestionControllerKind::Ledbat, false) => Box::new(Ledbat::new(rmss)),
         }
     }
 }

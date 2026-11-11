@@ -5,8 +5,9 @@
 // RFC 5681 https://datatracker.ietf.org/doc/html/rfc5681 (2009, draft) - congestion control, fast retransmit, fast recovery
 //
 // rfc8985 (draft, 2021) - RACK algorithm
-
-// TODO: LEDBAT congestion control
+//
+// Congestion control: CUBIC (RFC 8312, the default) or LEDBAT (RFC 6817, the delay-based
+// controller of BEP 29), see `CongestionControllerKind`.
 
 #[macro_use]
 mod macros;

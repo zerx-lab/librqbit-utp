@@ -90,4 +90,12 @@ where
             |s| s.inner.set_mss(mss)
         );
     }
+
+    fn on_delay_sample(&mut self, now: Instant, delay_micros: u32) {
+        self.inner.on_delay_sample(now, delay_micros);
+    }
+
+    fn on_send_round(&mut self, flight_size: usize, window_limited: bool) {
+        self.inner.on_send_round(flight_size, window_limited);
+    }
 }
