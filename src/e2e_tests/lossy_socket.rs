@@ -17,7 +17,9 @@ use tokio::{
     net::UdpSocket,
 };
 
-use crate::{SocketOpts, Transport, UtpSocket, traits::DefaultUtpEnvironment};
+use crate::{
+    CongestionControllerKind, SocketOpts, Transport, UtpSocket, traits::DefaultUtpEnvironment,
+};
 
 use super::AcceptConnect;
 
@@ -124,15 +126,15 @@ impl<const LOSS_PCT: usize> AcceptConnect for LossyUtpUdpSocket<LOSS_PCT> {
         UtpSocket::connect(self, addr).await.unwrap().split()
     }
 
-    async fn bind(addr: SocketAddr) -> Self {
+    async fn bind(addr: SocketAddr, congestion: CongestionControllerKind) -> Self {
         let socket = LossyUdpSocket::bind(addr).await.unwrap();
         UtpSocket::new_with_opts(
             socket,
             DefaultUtpEnvironment::default(),
             SocketOpts {
                 congestion: crate::CongestionConfig {
+                    kind: congestion,
                     tracing: true,
-                    ..Default::default()
                 },
                 dont_wait_for_lastack: false,
                 remote_inactivity_timeout: Some(Duration::from_secs(10)),

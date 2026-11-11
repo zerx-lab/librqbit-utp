@@ -3,7 +3,7 @@ mod lossy_socket;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -16,10 +16,14 @@ use tokio::{
 };
 use tracing::{Instrument, error_span, info};
 
-use crate::{SocketOpts, UtpSocketUdp, test_util::setup_test_logging};
+use crate::{
+    CongestionConfig, CongestionControllerKind, SocketOpts, UtpSocketUdp,
+    test_util::setup_test_logging,
+};
 
 trait AcceptConnect {
-    async fn bind(addr: SocketAddr) -> Self;
+    /// `congestion` selects our congestion controller; other implementations ignore it.
+    async fn bind(addr: SocketAddr, congestion: CongestionControllerKind) -> Self;
     async fn accept(&self) -> (impl AsyncRead + Unpin, impl AsyncWrite + Unpin);
     async fn connect(&self, addr: SocketAddr) -> (impl AsyncRead + Unpin, impl AsyncWrite + Unpin);
     fn bind_addr(&self) -> Option<SocketAddr>;
@@ -35,13 +39,13 @@ impl AcceptConnect for Arc<UtpSocketUdp> {
         UtpSocketUdp::connect(self, addr).await.unwrap().split()
     }
 
-    async fn bind(addr: SocketAddr) -> Self {
+    async fn bind(addr: SocketAddr, congestion: CongestionControllerKind) -> Self {
         UtpSocketUdp::new_udp_with_opts(
             addr,
             SocketOpts {
-                congestion: crate::CongestionConfig {
+                congestion: CongestionConfig {
+                    kind: congestion,
                     tracing: true,
-                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -67,7 +71,7 @@ impl AcceptConnect for Arc<UtpUdpContext> {
         tokio::io::split(s)
     }
 
-    async fn bind(addr: SocketAddr) -> Self {
+    async fn bind(addr: SocketAddr, _congestion: CongestionControllerKind) -> Self {
         UtpUdpContext::new_udp(addr).await.unwrap()
     }
 
@@ -125,10 +129,14 @@ async fn test_one_echo<T1: AcceptConnect, T2: AcceptConnect>(
     server_addr: SocketAddr,
     client_addr: SocketAddr,
     connect_ip: Option<IpAddr>,
+    congestion: CongestionControllerKind,
 ) {
     setup_test_logging();
 
-    let (server, client) = tokio::join!(T1::bind(server_addr), T2::bind(client_addr));
+    let (server, client) = tokio::join!(
+        T1::bind(server_addr, congestion),
+        T2::bind(client_addr, congestion)
+    );
     let server_port = server
         .bind_addr()
         .map(|a| a.port())
@@ -173,6 +181,18 @@ async fn e2e_test_librqbit_utp_client_librqbit_utp_server() {
         localhost_ipv4(0),
         localhost_ipv4(0),
         None,
+        CongestionControllerKind::Cubic,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn e2e_test_librqbit_utp_client_librqbit_utp_server_ledbat() {
+    test_one_echo::<Arc<crate::UtpSocketUdp>, Arc<crate::UtpSocketUdp>>(
+        localhost_ipv4(0),
+        localhost_ipv4(0),
+        None,
+        CongestionControllerKind::Ledbat,
     )
     .await;
 }
@@ -183,13 +203,31 @@ async fn e2e_test_librqbit_utp_client_librqbit_utp_server_ipv6() {
         localhost_ipv6(0),
         localhost_ipv6(0),
         None,
+        CongestionControllerKind::Cubic,
     )
     .await;
 }
 
 #[tokio::test]
-async fn e2e_test_librqbit_utp_client_librqbit_utp_server_dualstack() {
-    let f = test_one_echo::<Arc<crate::UtpSocketUdp>, Arc<crate::UtpSocketUdp>>;
+async fn e2e_test_librqbit_utp_client_librqbit_utp_server_ipv6_ledbat() {
+    test_one_echo::<Arc<crate::UtpSocketUdp>, Arc<crate::UtpSocketUdp>>(
+        localhost_ipv6(0),
+        localhost_ipv6(0),
+        None,
+        CongestionControllerKind::Ledbat,
+    )
+    .await;
+}
+
+async fn dualstack(congestion: CongestionControllerKind) {
+    let f = |server_addr, client_addr, connect_ip| {
+        test_one_echo::<Arc<crate::UtpSocketUdp>, Arc<crate::UtpSocketUdp>>(
+            server_addr,
+            client_addr,
+            connect_ip,
+            congestion,
+        )
+    };
 
     f(
         unspecified_ipv6(0),
@@ -243,11 +281,33 @@ async fn e2e_test_librqbit_utp_client_librqbit_utp_server_dualstack() {
 }
 
 #[tokio::test]
+async fn e2e_test_librqbit_utp_client_librqbit_utp_server_dualstack() {
+    dualstack(CongestionControllerKind::Cubic).await;
+}
+
+#[tokio::test]
+async fn e2e_test_librqbit_utp_client_librqbit_utp_server_dualstack_ledbat() {
+    dualstack(CongestionControllerKind::Ledbat).await;
+}
+
+#[tokio::test]
 async fn e2e_test_librqbit_utp_client_libutp_rs2_server() {
     test_one_echo::<Arc<crate::UtpSocketUdp>, Arc<libutp_rs2::UtpUdpContext>>(
         localhost_ipv4(8530),
         localhost_ipv4(8531),
         None,
+        CongestionControllerKind::Cubic,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn e2e_test_librqbit_utp_client_libutp_rs2_server_ledbat() {
+    test_one_echo::<Arc<crate::UtpSocketUdp>, Arc<libutp_rs2::UtpUdpContext>>(
+        localhost_ipv4(8532),
+        localhost_ipv4(8533),
+        None,
+        CongestionControllerKind::Ledbat,
     )
     .await;
 }
@@ -258,6 +318,18 @@ async fn e2e_test_libutp_rs2_client_librqbit_utp_server() {
         localhost_ipv4(8534),
         localhost_ipv4(8535),
         None,
+        CongestionControllerKind::Cubic,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn e2e_test_libutp_rs2_client_librqbit_utp_server_ledbat() {
+    test_one_echo::<Arc<libutp_rs2::UtpUdpContext>, Arc<crate::UtpSocketUdp>>(
+        localhost_ipv4(8538),
+        localhost_ipv4(8539),
+        None,
+        CongestionControllerKind::Ledbat,
     )
     .await;
 }
@@ -268,6 +340,7 @@ async fn e2e_test_libutp_rs2_client_libutp_rs2_server() {
         localhost_ipv4(8536),
         localhost_ipv4(8537),
         None,
+        CongestionControllerKind::Cubic,
     )
     .await;
 }
@@ -279,6 +352,19 @@ async fn e2e_test_loss_5_pct() {
         localhost_ipv4(0),
         localhost_ipv4(0),
         None,
+        CongestionControllerKind::Cubic,
+    )
+    .await
+}
+
+#[ignore]
+#[tokio::test]
+async fn e2e_test_loss_5_pct_ledbat() {
+    test_one_echo::<LossyUtpUdpSocket<5>, LossyUtpUdpSocket<5>>(
+        localhost_ipv4(0),
+        localhost_ipv4(0),
+        None,
+        CongestionControllerKind::Ledbat,
     )
     .await
 }
@@ -290,8 +376,76 @@ async fn e2e_test_loss_20_pct() {
         localhost_ipv4(0),
         localhost_ipv4(0),
         None,
+        CongestionControllerKind::Cubic,
     )
     .await
+}
+
+#[ignore]
+#[tokio::test]
+async fn e2e_test_loss_20_pct_ledbat() {
+    test_one_echo::<LossyUtpUdpSocket<20>, LossyUtpUdpSocket<20>>(
+        localhost_ipv4(0),
+        localhost_ipv4(0),
+        None,
+        CongestionControllerKind::Ledbat,
+    )
+    .await
+}
+
+/// Send `len` bytes over loopback and return how long it took until the receiver had them all.
+async fn bulk_transfer(congestion: CongestionControllerKind, len: usize) -> Duration {
+    let (server, client) = tokio::join!(
+        <Arc<UtpSocketUdp> as AcceptConnect>::bind(localhost_ipv4(0), congestion),
+        <Arc<UtpSocketUdp> as AcceptConnect>::bind(localhost_ipv4(0), congestion),
+    );
+    let server_addr = UtpSocketUdp::bind_addr(&server);
+    let started = Instant::now();
+
+    let receive = async {
+        let (mut r, _w) = AcceptConnect::accept(&server).await;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut received = 0;
+        while received < len {
+            let n = r.read(&mut buf).await.context("error reading")?;
+            anyhow::ensure!(n > 0, "EOF after {received} of {len} bytes");
+            received += n;
+        }
+        Ok::<_, anyhow::Error>(started.elapsed())
+    };
+    let send = async {
+        let (_r, mut w) = AcceptConnect::connect(&client, server_addr).await;
+        let chunk = vec![0u8; 64 * 1024];
+        let mut sent = 0;
+        while sent < len {
+            let n = chunk.len().min(len - sent);
+            w.write_all(&chunk[..n]).await.context("error writing")?;
+            sent += n;
+        }
+        // Keep the connection open until the receiver has everything.
+        Ok::<_, anyhow::Error>(w)
+    };
+
+    let (elapsed, _w) = timeout(TIMEOUT, async { try_join!(receive, send) })
+        .await
+        .expect("timeout")
+        .unwrap();
+    elapsed
+}
+
+// Without queuing delay (loopback) LEDBAT must not crawl: it should be about as fast as CUBIC.
+#[tokio::test]
+async fn e2e_test_ledbat_loopback_throughput_comparable_to_cubic() {
+    setup_test_logging();
+    const LEN: usize = 8 * 1024 * 1024;
+    let cubic = bulk_transfer(CongestionControllerKind::Cubic, LEN).await;
+    let ledbat = bulk_transfer(CongestionControllerKind::Ledbat, LEN).await;
+    info!(?cubic, ?ledbat, "8 MiB over loopback");
+    // Generous: real sockets on a machine that may be busy running other tests.
+    assert!(
+        ledbat < cubic * 4 + Duration::from_secs(2),
+        "LEDBAT took {ledbat:?}, CUBIC {cubic:?}"
+    );
 }
 
 async fn assert_connects(client: &Arc<UtpSocketUdp>, server: &Arc<UtpSocketUdp>) {
