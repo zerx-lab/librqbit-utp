@@ -459,7 +459,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 let header = UtpHeader {
                     htype: Type::ST_SYN,
                     connection_id: conn_id,
-                    timestamp_microseconds: (self.env.now() - self.socket.created).as_millis()
+                    // Microseconds like every other uTP timestamp: the peer echoes it back as
+                    // the first one-way delay sample. Truncating to u32 wraps, as BEP 29 expects.
+                    timestamp_microseconds: (self.env.now() - self.socket.created).as_micros()
                         as u32,
                     timestamp_difference_microseconds: 0,
                     wnd_size: 0,
