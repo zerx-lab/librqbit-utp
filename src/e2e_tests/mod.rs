@@ -443,7 +443,7 @@ async fn e2e_test_ledbat_loopback_throughput_comparable_to_cubic() {
     info!(?cubic, ?ledbat, "8 MiB over loopback");
     // Generous: real sockets on a machine that may be busy running other tests.
     assert!(
-        ledbat < cubic * 4 + Duration::from_secs(2),
+        ledbat < cubic * 2 + Duration::from_secs(1),
         "LEDBAT took {ledbat:?}, CUBIC {cubic:?}"
     );
 }
